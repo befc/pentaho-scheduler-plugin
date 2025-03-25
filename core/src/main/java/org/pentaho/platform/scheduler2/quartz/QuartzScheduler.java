@@ -77,7 +77,6 @@ import org.quartz.TriggerBuilder;
 import org.quartz.TriggerKey;
 import org.quartz.impl.StdSchedulerFactory;
 import org.quartz.impl.matchers.GroupMatcher;
-import org.quartz.impl.triggers.AbstractTrigger;
 import org.quartz.impl.triggers.CalendarIntervalTriggerImpl;
 import org.quartz.impl.triggers.CronTriggerImpl;
 import org.quartz.spi.MutableTrigger;
@@ -104,6 +103,7 @@ import java.util.regex.Pattern;
  */
 public class QuartzScheduler implements IScheduler {
 
+  public static final String KEY_PREVIOUS_TRIGGER_NOW = "previousTriggerNow";
   private Log logger;
 
   private SchedulerFactory quartzSchedulerFactory;
@@ -315,9 +315,7 @@ public class QuartzScheduler implements IScheduler {
 
         calendarIntervalTrigger.setRepeatInterval( triggerInterval );
         calendarIntervalTrigger.setRepeatIntervalUnit( intervalUnit );
-        // Set the misfire instruction to ignore misfires. This is required due to triggerNow() requiring to
-        // update the previous fire time to the current time, which Quartz does not allow.
-        calendarIntervalTrigger.setMisfireInstruction( CalendarIntervalTrigger.MISFIRE_INSTRUCTION_DO_NOTHING );
+        calendarIntervalTrigger.setMisfireInstruction( CalendarIntervalTrigger.MISFIRE_INSTRUCTION_FIRE_ONCE_NOW );
         if ( null != triggerEndDate ) {
           calendarIntervalTrigger.setEndTime( triggerEndDate );
         }
@@ -349,6 +347,7 @@ public class QuartzScheduler implements IScheduler {
     JobDataMap jobDataMap = new JobDataMap( jobParams );
     JobDetail jobDetail = JobBuilder.newJob( BlockingQuartzJob.class )
       .withIdentity( jobId.toString(), jobId.getUserName() )
+      .storeDurably()
       .setJobData( jobDataMap )
       .build();
     return jobDetail;
@@ -464,7 +463,7 @@ public class QuartzScheduler implements IScheduler {
     job.setJobParams( jobParams );
     job.setJobTrigger( (JobTrigger) trigger );
     job.setNextRun( quartzTrigger.getNextFireTime() );
-    job.setLastRun( quartzTrigger.getPreviousFireTime() );
+    job.setLastRun( getLastRun( quartzTrigger ) );
     job.setJobId( jobId.toString() );
     job.setJobName( jobName );
     job.setUserName( curUser );
@@ -553,79 +552,23 @@ public class QuartzScheduler implements IScheduler {
    */
   public void triggerNow( String jobId ) throws SchedulerException {
     try {
-      QuartzJobKey jobKey = QuartzJobKey.parse( jobId );
+      QuartzJobKey quartzJobKey = QuartzJobKey.parse( jobId );
       Scheduler scheduler = getQuartzScheduler();
-      String groupName = jobKey.getUserName();
-      for ( Trigger trigger : scheduler.getTriggersOfJob( new JobKey( jobId, groupName ) ) ) {
-        // triggerJob below causes quartz to make a new trigger starting with MT_ internally.  Ignore those.
-        if ( isManualTrigger( trigger ) ) {
-          continue;
-        }
+      String groupName = quartzJobKey.getUserName();
+      JobKey jobKey = new JobKey( jobId, groupName );
 
-        if ( !previousFireTimeInMisfireWindow( trigger ) ) {
-          AbstractTrigger<?> abstractTrigger = (AbstractTrigger<?>) trigger;
-          // Update trigger with the execution date
-          //   this ensures the Last Run column shows this manual execution
-          abstractTrigger.setPreviousFireTime( new Date() );
-          // Reschedule the original trigger to update the previous fire time
-          //   this does not cause the job to run as long as we are not inside the misfire window
-          scheduler.rescheduleJob( trigger.getKey(), trigger );
-        }
+      JobDetail jobDetail = scheduler.getJobDetail( jobKey );
+      JobDataMap jobDataMap = jobDetail.getJobDataMap();
+      jobDataMap.put( KEY_PREVIOUS_TRIGGER_NOW, new Date() );
 
-        // Execute the job
-        scheduler.triggerJob( new JobKey( jobId, groupName ) );
-      }
+      // Update the job with the time of this manual trigger
+      scheduler.addJob( jobDetail, true );
+
+      // Execute the job
+      scheduler.triggerJob( jobKey );
     } catch ( org.quartz.SchedulerException e ) {
       throw new SchedulerException( Messages.getInstance().getString(
         "QuartzScheduler.ERROR_0007_FAILED_TO_GET_JOB", jobId ), e );
-    }
-  }
-
-  private boolean previousFireTimeInMisfireWindow( Trigger trigger ) throws org.quartz.SchedulerException {
-    Scheduler scheduler = getQuartzScheduler();
-    long misfireThresholdMillis = getMisfireThresholdMillis( scheduler );
-    long currentTime = System.currentTimeMillis();
-    long previousFireTime;
-
-    if ( ( trigger instanceof CalendarIntervalTrigger || trigger instanceof ComplexJobTrigger )
-        && trigger.getNextFireTime() != null ) {
-      // previous fire time is next fire time minus repeat interval, so that it's not affected by manual triggers
-      // this is only possible for instances of triggers that have a repeat interval, not CronTriggers for example
-      previousFireTime = trigger.getNextFireTime().getTime() - getRepeatIntervalMillis( trigger );
-    } else if ( trigger.getPreviousFireTime() != null ) {
-      previousFireTime = trigger.getPreviousFireTime().getTime();
-    } else {
-      // if the trigger has never fired, we don't want to consider it in the misfire window
-      return false;
-    }
-
-    return currentTime - previousFireTime < misfireThresholdMillis;
-  }
-
-  private static long getMisfireThresholdMillis( Scheduler scheduler ) throws org.quartz.SchedulerException {
-    String misfireThreshold = (String) scheduler.getContext().get( "org.quartz.jobStore.misfireThreshold" );
-    return misfireThreshold == null ? 60000 : Long.parseLong( misfireThreshold );
-  }
-
-  private static long getRepeatIntervalMillis( Trigger trigger ) {
-    if ( trigger instanceof CalendarIntervalTrigger ) {
-      CalendarIntervalTrigger calendarIntervalTrigger = (CalendarIntervalTrigger) trigger;
-      DateBuilder.IntervalUnit intervalUnit = calendarIntervalTrigger.getRepeatIntervalUnit();
-      int repeatInterval = calendarIntervalTrigger.getRepeatInterval();
-      switch ( intervalUnit ) {
-        case SECOND:
-          return repeatInterval * 1000L;
-        case MINUTE:
-          return repeatInterval * 60 * 1000L;
-        case HOUR:
-          return repeatInterval * 60 * 60 * 1000L;
-        case DAY:
-          return repeatInterval * 24 * 60 * 60 * 1000L;
-        default:
-          return 0;
-      }
-    } else {
-      return 0;
     }
   }
 
@@ -707,7 +650,7 @@ public class QuartzScheduler implements IScheduler {
             setJobTrigger( scheduler, job, trigger );
             job.setJobName( QuartzJobKey.parse( jobId ).getJobName() );
             setJobNextRun( job, trigger );
-            job.setLastRun( trigger.getPreviousFireTime() );
+            job.setLastRun( getLastRun( trigger ) );
             if ( ( filter == null ) || filter.accept( job ) ) {
               jobs.add( job );
             }
@@ -719,6 +662,42 @@ public class QuartzScheduler implements IScheduler {
         Messages.getInstance().getString( "QuartzScheduler.ERROR_0004_FAILED_TO_LIST_JOBS" ), e );
     }
     return jobs;
+  }
+
+  private Date getLastRun( Trigger trigger ) {
+    Date previousTriggerNow = getPreviousTriggerNow( trigger );
+    Date previousFireTime = trigger.getPreviousFireTime();
+
+    if ( previousTriggerNow == null ) {
+      return previousFireTime;
+    }
+
+    return ( previousFireTime == null || previousTriggerNow.after( previousFireTime ) )
+         ? previousTriggerNow : previousFireTime;
+  }
+
+  private Date getPreviousTriggerNow( Trigger trigger ) {
+    JobDetail jobDetail;
+
+    try {
+      Scheduler scheduler = getQuartzScheduler();
+      jobDetail = scheduler.getJobDetail( trigger.getJobKey() );
+    } catch ( org.quartz.SchedulerException e ) {
+      logger.warn( "Unable to obtain previous trigger now", e );
+      return null;
+    }
+
+    JobDataMap jobDataMap = jobDetail.getJobDataMap();
+    if ( !jobDetail.getJobDataMap().containsKey( KEY_PREVIOUS_TRIGGER_NOW ) ) {
+      return null;
+    }
+
+    Object previousTriggerNowObj = jobDataMap.get( KEY_PREVIOUS_TRIGGER_NOW );
+    if ( !( previousTriggerNowObj instanceof Date ) ) {
+      return null;
+    }
+
+    return (Date) previousTriggerNowObj;
   }
 
   protected void setJobNextRun( Job job, Trigger trigger ) {
@@ -850,7 +829,7 @@ public class QuartzScheduler implements IScheduler {
 
     job.setJobName( QuartzJobKey.parse( job.getJobId() ).getJobName() );
     job.setNextRun( trigger.getNextFireTime() );
-    job.setLastRun( trigger.getPreviousFireTime() );
+    job.setLastRun( getLastRun( trigger ) );
 
   }
 
